@@ -214,15 +214,37 @@ function appShell(){
       };
     },
     copy(text){
-      // navigator.clipboard 仅在安全上下文（HTTPS / localhost）存在：非安全部署下
-      // 访问它会同步抛 TypeError，须判空 + catch，否则复制按钮静默失败。
-      if(!navigator.clipboard || !navigator.clipboard.writeText){
-        this.toast('当前环境不支持剪贴板复制','err');
+      // 复制有三类失败：非安全上下文（navigator.clipboard 不存在，例如用局域网 IP
+      // 访问 http://192.168.x.x）、文档未获得焦点或权限被拒（writeText 以
+      // NotAllowedError 拒绝，内嵌 webview 常见）、浏览器彻底禁用剪贴板。
+      // 前两类分别由 execCommand 兜底与回显真实原因覆盖，避免只报「复制失败」。
+      const ok = () => this.toast('已复制到剪贴板','ok');
+      const legacy = () => {
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text == null ? '' : String(text);
+          ta.setAttribute('readonly','');
+          ta.style.cssText = 'position:fixed;top:0;left:-9999px;opacity:0';
+          document.body.appendChild(ta);
+          ta.select();
+          ta.setSelectionRange(0, ta.value.length);
+          const done = document.execCommand('copy');
+          document.body.removeChild(ta);
+          return done;
+        } catch(e) { return false; }
+      };
+      const fail = (why) => this.toast('复制失败：' + why + '，请手动选中后按 ⌘C','err');
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text)
+          .then(ok)
+          .catch((e) => {
+            if(legacy()) ok();
+            else fail((e && e.name) || '未知原因');
+          });
         return;
       }
-      navigator.clipboard.writeText(text)
-        .then(()=>this.toast('已复制到剪贴板','ok'))
-        .catch(()=>this.toast('复制失败','err'));
+      if(legacy()) ok();
+      else fail('当前环境不支持剪贴板复制');
     },
     fmt(n){ return (n||0).toLocaleString(); },
     compact(n){
