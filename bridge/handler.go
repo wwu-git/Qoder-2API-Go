@@ -19,19 +19,18 @@ import (
 	"qoder2api/transform"
 )
 
-// ResolvedBridge is what a BridgeResolver returns: the bridge for the current
-// PAT plus the authenticated key's metadata, which labels the request log.
-// Only the key's ID and note are carried — never the raw key material.
-type ResolvedBridge struct {
-	Bridge  *OpenAiBridge
+// ResolvedAccess is what a BridgeResolver returns: the token pool that may serve
+// the request plus the authenticated key's metadata, which labels the request
+// log. Only the key's ID and note are carried — never the raw key material.
+type ResolvedAccess struct {
+	Pool    *Pool
 	KeyID   string // authenticated key's ID ("" when unknown)
 	KeyNote string // authenticated key's note
 }
 
-// BridgeResolver resolves an API key to the current bridge plus its key
-// metadata, or nil if the key is invalid or no PAT is configured. Implemented
-// by the caller (main package).
-type BridgeResolver func(apiKey string) *ResolvedBridge
+// BridgeResolver resolves an API key to the token pool plus its key metadata, or
+// nil if the key is not configured. Implemented by the caller (main package).
+type BridgeResolver func(apiKey string) *ResolvedAccess
 
 func extractBearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
@@ -58,7 +57,7 @@ func writeError(w http.ResponseWriter, statusCode int, errType, message string) 
 }
 
 // MakeChatHandler creates the /v1/chat/completions handler. The resolver
-// validates the API key and returns the single bridge instance. rec records
+// validates the API key and returns the token pool that may serve it. rec records
 // request statistics and lr audit-log entries (metadata only); both may be nil.
 func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Recorder) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -68,15 +67,24 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			writeError(w, 401, "invalid_request_error", "Missing Authorization: Bearer <key>")
 			return
 		}
-		var rb *ResolvedBridge
+		var rb *ResolvedAccess
 		if resolver != nil {
 			rb = resolver(token)
 		}
-		if rb == nil || rb.Bridge == nil {
-			writeError(w, 401, "invalid_request_error", "Invalid API key or no PAT configured")
+		if rb == nil {
+			// The client's own key is what failed here; the state of the token
+			// pool is a different answer and must not be conflated with it.
+			writeError(w, 401, "invalid_request_error", "Invalid API key")
 			return
 		}
-		b := rb.Bridge
+		if rb.Pool == nil {
+			entry0 := &logs.LogEntry{KeyID: rb.KeyID, KeyNote: rb.KeyNote, StatusCode: 503, ErrorMsg: "no token pool configured"}
+			if lr != nil {
+				lr.Record(entry0)
+			}
+			writeError(w, 503, "upstream_error", "未配置访问令牌，请在令牌页添加账号")
+			return
+		}
 
 		// One log entry per authenticated request; auth failures are rejected
 		// above and never logged. Fields are filled in below and the entry is
@@ -105,7 +113,7 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 		}
 
 		// Only authenticated requests with a valid body are counted.
-		model := statsModelLabel(reqBody, b, r.Context())
+		model := statsModelLabel(reqBody, rb.Pool.LabelBridge(), r.Context())
 		entry.Model = model
 		entry.Stream, _ = reqBody["stream"].(bool)
 		record := func(ok bool) {
@@ -135,7 +143,15 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			}
 		}
 
-		err := b.HandleChat(r.Context(), w, reqBody, usageSink)
+		attempts, err := rb.Pool.Do(r.Context(), w, reqBody, usageSink)
+		if len(attempts) > 1 {
+			// A failover trail: the request touched more than one account, and
+			// the audit log must say so (credits were spent on both).
+			entry.Attempts = attempts
+		}
+		if n := len(attempts); n > 0 {
+			entry.TokenID, entry.TokenNote = attempts[n-1].TokenID, attempts[n-1].Note
+		}
 		if err != nil {
 			// A client-initiated disconnect (or server shutdown) is not a
 			// request failure and must not skew the success rate.
@@ -154,6 +170,36 @@ func MakeChatHandler(resolver BridgeResolver, rec *stats.Recorder, lr *logs.Reco
 			if errors.As(err, &paramErr) {
 				entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(paramErr.Error(), 500)
 				writeError(w, 400, "invalid_request_error", paramErr.Error())
+				record(false)
+				return
+			}
+			var noAccErr *NoAccountError
+			if errors.As(err, &noAccErr) {
+				// Capacity, not a client fault: nothing in the pool may take
+				// traffic, and no upstream was contacted.
+				entry.StatusCode, entry.ErrorMsg = 503, truncateRunes(noAccErr.Error(), 500)
+				if noAccErr.RetryAfter > 0 {
+					// Every account is waiting out a backoff the gateway itself
+					// asked for: answer 429 with that wait so the client backs off
+					// instead of retrying onto a pool we already know is busy.
+					retrySecs := int((noAccErr.RetryAfter + time.Second - 1) / time.Second)
+					if retrySecs < 1 {
+						retrySecs = 1
+					}
+					w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+					entry.StatusCode = 429
+					writeError(w, 429, "rate_limit_error", noAccErr.Error())
+				} else {
+					writeError(w, 503, "upstream_error", noAccErr.Error())
+				}
+				record(false)
+				return
+			}
+			var capErr *models.CapabilityError
+			if errors.As(err, &capErr) {
+				// No account in the pool can serve this capability.
+				entry.StatusCode, entry.ErrorMsg = 400, truncateRunes(capErr.Error(), 500)
+				writeError(w, 400, "invalid_request_error", capErr.Error())
 				record(false)
 				return
 			}
@@ -272,27 +318,19 @@ func writeUpstreamRejection(w http.ResponseWriter, status int, body string, retr
 }
 
 // MakeModelsHandler creates the /v1/models handler.
-// The resolver validates the API key and returns the single bridge instance.
-// If the key is invalid or no PAT is configured, the built-in default catalog
-// is returned as a fallback.
+// The resolver validates the API key and returns the token pool, whose catalog
+// is the union of every configured account. If the key is invalid, the built-in
+// default catalog is returned as a fallback.
 func MakeModelsHandler(resolver BridgeResolver) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := extractBearerToken(r)
-		var b *OpenAiBridge
+		var catalog *models.ModelCatalog
 		if resolver != nil && token != "" {
-			if rb := resolver(token); rb != nil {
-				b = rb.Bridge
+			if rb := resolver(token); rb != nil && rb.Pool != nil {
+				catalog = rb.Pool.Models(r.Context())
 			}
 		}
-		if b != nil {
-			catalog := b.GetCatalog(r.Context())
-			payload := models.ModelsPayload(catalog)
-			w.Header().Set("Content-Type", "application/json")
-			bs, _ := marshalNoEscape(payload)
-			w.Write(bs)
-			return
-		}
-		payload := models.ModelsPayload(nil)
+		payload := models.ModelsPayload(catalog)
 		w.Header().Set("Content-Type", "application/json")
 		bs, _ := marshalNoEscape(payload)
 		w.Write(bs)

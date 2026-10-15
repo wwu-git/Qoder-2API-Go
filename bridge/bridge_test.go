@@ -40,7 +40,7 @@ func TestChatRouteReturns401WithoutBearerToken(t *testing.T) {
 }
 
 func TestChatRouteRejectsInvalidApiKey(t *testing.T) {
-	resolver := func(apiKey string) *ResolvedBridge { return nil }
+	resolver := func(apiKey string) *ResolvedAccess { return nil }
 	handler := MakeChatHandler(resolver, nil, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
@@ -111,7 +111,7 @@ func TestChatRouteDoesNotRecordUnauthorized(t *testing.T) {
 // Malformed JSON with a valid key must be rejected and not counted.
 func TestChatRouteDoesNotRecordInvalidJSON(t *testing.T) {
 	rec := stats.NewRecorder(nil)
-	resolver := func(apiKey string) *ResolvedBridge { return &ResolvedBridge{Bridge: &OpenAiBridge{}} }
+	resolver := func(apiKey string) *ResolvedAccess { return &ResolvedAccess{Pool: poolOfBridges(&OpenAiBridge{})} }
 	handler := MakeChatHandler(resolver, rec, nil)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
@@ -250,6 +250,19 @@ func TestCurrentIdentitySnapshot(t *testing.T) {
 type fakeGateway struct {
 	chatLines []string // raw SSE lines ("data: {...}")
 
+	// chatStatus, when non-zero, answers the chat call with that HTTP status
+	// instead of a stream. This is how the pool tests inject gateway verdicts:
+	// 401 means the credential was rejected, 429 admission control, 503 a
+	// provider fault.
+	chatStatus int
+	// modelListJSON replaces the default single-model fixture so a test can give
+	// two accounts different catalogs.
+	modelListJSON string
+
+	// chatHits counts chat endpoint calls, so a test can prove a committed
+	// response was not replayed onto the next account.
+	chatHits atomic.Int32
+
 	mu          sync.Mutex
 	chatBody    []byte
 	chatHeaders http.Header
@@ -276,6 +289,10 @@ func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
 	})
 	mux.HandleFunc("/algo/api/v2/model/list", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if gw.modelListJSON != "" {
+			io.WriteString(w, gw.modelListJSON)
+			return
+		}
 		// Fixture deliberately mirrors the live catalog shape: thinking metadata
 		// is nested under thinking_config, not flattened onto the entry. A flat
 		// fixture is what let the original parser pass tests while reading a
@@ -284,10 +301,15 @@ func newFakeBridge(t *testing.T, gw *fakeGateway) *OpenAiBridge {
 	})
 	mux.HandleFunc("/algo/api/v2/service/pro/sse/agent_chat_generation", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		gw.chatHits.Add(1)
 		gw.mu.Lock()
 		gw.chatBody = body
 		gw.chatHeaders = r.Header.Clone()
 		gw.mu.Unlock()
+		if gw.chatStatus != 0 {
+			http.Error(w, "gateway says no", gw.chatStatus)
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher := w.(http.Flusher)
 		for _, l := range gw.chatLines {
@@ -314,7 +336,10 @@ func sseFrame(t *testing.T, inner map[string]interface{}) string {
 // client's requested model on every client-facing chunk and on the sync
 // response, so "auto" never leaks to clients.
 func TestHandleChatStampsRequestedModelOnResponses(t *testing.T) {
-	for _, tc := range []struct{ name string; stream bool }{
+	for _, tc := range []struct {
+		name   string
+		stream bool
+	}{
 		{"stream", true},
 		{"sync", false},
 	} {
@@ -328,8 +353,8 @@ func TestHandleChatStampsRequestedModelOnResponses(t *testing.T) {
 
 			w := httptest.NewRecorder()
 			err := b.HandleChat(context.Background(), w, map[string]interface{}{
-				"model":   "Fake-Model",
-				"stream":  tc.stream,
+				"model":    "Fake-Model",
+				"stream":   tc.stream,
 				"messages": []interface{}{map[string]interface{}{"role": "user", "content": "q"}},
 			}, nil)
 			if err != nil {
@@ -363,7 +388,7 @@ func TestHandleChatStampsRequestedModelOnResponses(t *testing.T) {
 				ChatContext struct {
 					Extra struct {
 						ModelConfig struct {
-								Key string `json:"key"`
+							Key string `json:"key"`
 						} `json:"modelConfig"`
 					} `json:"extra"`
 				} `json:"chat_context"`
@@ -399,7 +424,7 @@ func TestHandleStreamEndToEnd(t *testing.T) {
 		"messages": []interface{}{
 			map[string]interface{}{"role": "user", "content": "hi"},
 		},
-		"stream": true,
+		"stream":         true,
 		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) { usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, Credits: u.Credits} })
 	if err != nil {
@@ -690,7 +715,7 @@ func TestChatRouteRejectsMalformedParamTypes(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(resolverFor(b), nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":"8000"}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -713,7 +738,7 @@ func TestChatRouteRejectsMultiChoice(t *testing.T) {
 		"data: [DONE]",
 	}}
 	b := newFakeBridge(t, gw)
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(resolverFor(b), nil, nil)
 
 	body := `{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true,"n":3}`
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
@@ -757,7 +782,7 @@ func TestHandleStreamGLMStyleUsageOnFinalContentFrame(t *testing.T) {
 		"messages": []interface{}{
 			map[string]interface{}{"role": "user", "content": "sky color"},
 		},
-		"stream": true,
+		"stream":         true,
 		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) {
 		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, CachedTokens: u.CachedPromptTokens(), Credits: u.Credits}
@@ -855,7 +880,7 @@ func TestHandleStreamProviderErrorSurfacesRealCause(t *testing.T) {
 	// The failure frames carry no content, so nothing is committed to the
 	// client and the rejection must surface as a real HTTP status carrying the
 	// embedded 429 — not a 200 SSE stream whose success every SDK would read.
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(resolverFor(b), nil, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
 		`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -909,7 +934,7 @@ func TestHandleStreamMiniMaxStyleFinishEvent(t *testing.T) {
 		"messages": []interface{}{
 			map[string]interface{}{"role": "user", "content": "sky color"},
 		},
-		"stream": true,
+		"stream":         true,
 		"stream_options": map[string]interface{}{"include_usage": true},
 	}, func(u *transform.Usage) {
 		usageSeen = &stats.Usage{PromptTokens: u.PromptTokens, CompletionTokens: u.CompletionTokens, Credits: u.Credits}
@@ -1205,7 +1230,7 @@ func TestMakeChatHandlerMapsBusyTo429(t *testing.T) {
 	gw := &busyGateway{busyFirstN: 99}
 	b := newBusyBridge(t, gw)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+	handler := MakeChatHandler(resolverFor(b), nil, nil)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
@@ -1874,7 +1899,7 @@ func TestHandleChatRecordsNonBillableUsage(t *testing.T) {
 	b := newFakeBridge(t, gw)
 	rec := stats.NewRecorder(nil)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil)
+	handler := MakeChatHandler(resolverFor(b), rec, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -1910,7 +1935,7 @@ func TestHandleChatAttributesCreditsToRequestedModel(t *testing.T) {
 	b := newFakeBridge(t, gw)
 	rec := stats.NewRecorder(nil)
 
-	handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, rec, nil)
+	handler := MakeChatHandler(resolverFor(b), rec, nil)
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
@@ -2017,7 +2042,7 @@ func TestMakeChatHandlerMapsUpstreamErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gw := &rejectingGateway{status: tc.status, body: tc.body, retryAfter: tc.retryAfter}
 			b := newRejectingBridge(t, gw)
-			handler := MakeChatHandler(func(string) *ResolvedBridge { return &ResolvedBridge{Bridge: b} }, nil, nil)
+			handler := MakeChatHandler(resolverFor(b), nil, nil)
 
 			req := httptest.NewRequest("POST", "/v1/chat/completions",
 				strings.NewReader(`{"model":"Fake-Model","messages":[{"role":"user","content":"hi"}]}`))

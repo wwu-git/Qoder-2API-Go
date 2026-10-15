@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"qoder2api/auth"
+	"qoder2api/bridge"
 	"qoder2api/logs"
 	"qoder2api/models"
 	"qoder2api/stats"
@@ -35,21 +36,28 @@ type Admin struct {
 	modelFetcher ModelFetcher
 	stats        *stats.Recorder
 	logRec       *logs.Recorder
-	sessions     map[string]time.Time
-	sessionMu    sync.Mutex
-	limiter      *loginLimiter
+	pool         *bridge.Pool
+	// verifyPAT checks a credential against the gateway before it is trusted
+	// with traffic. It is a field so a test can stub the gateway; production
+	// uses bridge.VerifyPAT.
+	verifyPAT func(ctx context.Context, pat string) (*auth.AccountStatus, error)
+	sessions  map[string]time.Time
+	sessionMu sync.Mutex
+	limiter   *loginLimiter
 }
 
 // ModelFetcher returns the current model catalog (dynamic or fallback).
 type ModelFetcher func(ctx context.Context) []string
 
-// New creates an Admin instance. rec and lr may be nil.
-func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder, lr *logs.Recorder) *Admin {
+// New creates an Admin instance. rec, lr and pool may be nil.
+func New(s *store.Store, mf ModelFetcher, rec *stats.Recorder, lr *logs.Recorder, pool *bridge.Pool) *Admin {
 	return &Admin{
 		store:        s,
 		modelFetcher: mf,
 		stats:        rec,
 		logRec:       lr,
+		pool:         pool,
+		verifyPAT:    bridge.VerifyPAT,
 		sessions:     make(map[string]time.Time),
 		limiter:      newLoginLimiter(),
 	}
@@ -68,7 +76,8 @@ func (a *Admin) RegisterRoutes(mux *http.ServeMux) {
 
 	// Protected API endpoints (require auth)
 	mux.HandleFunc("/admin/api/keys", a.requireAuth(a.handleKeys))
-	mux.HandleFunc("/admin/api/pat", a.requireAuth(a.handlePAT))
+	mux.HandleFunc("/admin/api/tokens", a.requireAuth(a.handleTokens))
+	mux.HandleFunc("/admin/api/tokens/verify", a.requireAuth(a.handleTokenVerify))
 	mux.HandleFunc("/admin/api/models", a.requireAuth(a.handleModels))
 	mux.HandleFunc("/admin/api/stats", a.requireAuth(a.handleStats))
 	mux.HandleFunc("/admin/api/logs", a.requireAuth(a.handleLogs))
@@ -583,30 +592,273 @@ func (a *Admin) handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// --- PAT endpoint ---
+// --- Token pool endpoints ---
 
-func (a *Admin) handlePAT(w http.ResponseWriter, r *http.Request) {
+// TokenView is one pool account as the panel sees it: the masked credential and
+// config weight, plus the live health verdict and allowance the bridge cached
+// out of band. Building the view performs no upstream call.
+type TokenView struct {
+	ID        string `json:"id"`
+	PATMasked string `json:"pat_masked"`
+	Note      string `json:"note"`
+	Weight    int    `json:"weight"`
+	// Disabled is the operator switch: the account stays configured but is held
+	// out of rotation by hand.
+	Disabled  bool  `json:"disabled"`
+	CreatedAt int64 `json:"created_at"`
+	// State is the gateway's verdict, independent of the operator switch:
+	// "healthy", "cooldown" (busy / rate-limited / exhausted), or "disabled"
+	// (the credential itself was refused).
+	State           string  `json:"state"`
+	Reason          string  `json:"reason,omitempty"`
+	CooldownUntilMs int64   `json:"cooldown_until_ms,omitempty"`
+	Plan            string  `json:"plan,omitempty"`
+	Tag             string  `json:"tag,omitempty"`
+	OrgName         string  `json:"org_name,omitempty"`
+	QuotaUsed       float64 `json:"quota_used"`
+	QuotaTotal      float64 `json:"quota_total"`
+	QuotaRemaining  float64 `json:"quota_remaining"`
+	QuotaPercentage float64 `json:"quota_percentage"`
+	QuotaUnit       string  `json:"quota_unit,omitempty"`
+	// HasQuota distinguishes an account whose allowance is genuinely 0 from one
+	// the account services have never reported for yet.
+	HasQuota        bool  `json:"has_quota"`
+	IsQuotaExceeded bool  `json:"is_quota_exceeded"`
+	NextResetAtMs   int64 `json:"next_reset_at_ms,omitempty"`
+}
+
+// tokenViews pairs the stored config with the pool's live state. An account the
+// pool has not reconciled yet still appears (state "healthy"), because the
+// operator needs to see and edit it either way.
+func (a *Admin) tokenViews() []TokenView {
+	tokens := a.store.ListTokens()
+	views := make([]TokenView, 0, len(tokens))
+	for _, t := range tokens {
+		v := TokenView{
+			ID: t.ID, PATMasked: maskPAT(t.PAT), Note: t.Note,
+			Weight: t.Weight, Disabled: t.Disabled, CreatedAt: t.CreatedAt,
+			State: bridge.StateHealthy.String(),
+		}
+		if a.pool != nil {
+			if e := a.pool.Find(t.ID); e != nil {
+				st := e.Status()
+				v.State = st.State.String()
+				v.Reason = st.Reason
+				v.CooldownUntilMs = st.CooldownUntilMs
+			}
+		}
+		if acc := a.accountOf(t.ID); acc != nil {
+			v.Plan, v.Tag, v.OrgName = acc.Plan, acc.UserTag, acc.OrgName
+			v.IsQuotaExceeded = acc.IsQuotaExceeded
+			v.NextResetAtMs = acc.NextResetAtMs
+			if q := acc.UserQuota; q != nil {
+				v.HasQuota = true
+				v.QuotaUsed, v.QuotaTotal, v.QuotaRemaining = q.Used, q.Total, q.Remaining
+				v.QuotaPercentage, v.QuotaUnit = q.Percentage, q.Unit
+			}
+		}
+		views = append(views, v)
+	}
+	return views
+}
+
+// accountOf returns the cached subscription snapshot of one pool account, or nil
+// when the account loop has not fetched it yet. It never reaches the gateway.
+func (a *Admin) accountOf(id string) *auth.AccountStatus {
+	if a.pool == nil {
+		return nil
+	}
+	e := a.pool.Find(id)
+	if e == nil {
+		return nil
+	}
+	b := e.Bridge()
+	if b == nil {
+		return nil
+	}
+	return b.AccountStatus()
+}
+
+func (a *Admin) handleTokens(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		// Only the masked form is exposed; the plaintext PAT never leaves
-		// the server. The UI edits it as a whole new value, never in place.
-		masked := maskPAT(a.store.GetPAT())
-		writeJSON(w, 200, map[string]string{"pat_masked": masked})
+		views := a.tokenViews()
+		available := 0
+		if a.pool != nil {
+			available = a.pool.Available()
+		}
+		writeJSON(w, 200, map[string]interface{}{
+			// total is the configured count (the store is its source); available
+			// is the pool's live verdict on how many of them may take traffic.
+			"tokens": views, "total": len(views), "available": available,
+		})
 	case http.MethodPost:
-		var body struct {
-			PAT string `json:"pat"`
-		}
-		if err := readJSON(w, r, &body); err != nil {
-			writeJSONError(w, 400, "请求格式错误")
-			return
-		}
-		if err := a.store.SetPAT(body.PAT); err != nil {
-			writeJSONError(w, 500, err.Error())
-			return
-		}
-		writeJSON(w, 200, map[string]string{"status": "ok"})
+		a.addToken(w, r)
+	case http.MethodPut:
+		a.patchToken(w, r)
+	case http.MethodDelete:
+		a.deleteToken(w, r)
 	default:
 		writeJSONError(w, 405, "方法不允许")
+	}
+}
+
+// addToken validates the credential with the gateway *before* persisting it. A
+// PAT that cannot open a session would otherwise sit in the pool, get picked by
+// the round-robin, and cost the client a failed account rotation.
+func (a *Admin) addToken(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		PAT    string `json:"pat"`
+		Note   string `json:"note"`
+		Weight int    `json:"weight"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	pat := strings.TrimSpace(body.PAT)
+	if pat == "" {
+		writeJSONError(w, 400, "令牌不能为空")
+		return
+	}
+	if body.Weight == 0 {
+		body.Weight = store.DefaultTokenWeight
+	}
+	if err := store.ValidateTokenWeight(body.Weight); err != nil {
+		writeJSONError(w, 400, err.Error())
+		return
+	}
+	// Reject a duplicate from the stored config rather than from the pool: the
+	// pool may lag the file, and the operator must not pay for a verification
+	// round trip to learn the account is already there.
+	for _, t := range a.store.ListTokens() {
+		if t.PAT == pat {
+			writeJSONError(w, 409, "该令牌已在池中")
+			return
+		}
+	}
+	st, err := a.verifyPAT(r.Context(), pat)
+	if err != nil {
+		writeJSONError(w, 400, "令牌校验失败，未保存："+err.Error())
+		return
+	}
+	tok, err := a.store.AddToken(pat, body.Note, body.Weight)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrDuplicateToken):
+			writeJSONError(w, 409, "该令牌已在池中")
+		default:
+			writeJSONError(w, 500, err.Error())
+		}
+		return
+	}
+	resp := map[string]interface{}{"status": "added", "token": tokView(*tok)}
+	if st != nil {
+		resp["plan"] = st.Plan
+		resp["tag"] = st.UserTag
+	}
+	writeJSON(w, 201, resp)
+}
+
+// patchToken updates note / weight / the operator switch. The credential itself
+// is not editable: replacing a PAT means removing the account and adding the new
+// one, which is also what keeps the health verdict honest.
+func (a *Admin) patchToken(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeJSONError(w, 400, "缺少 id 参数")
+		return
+	}
+	var body struct {
+		Note     *string `json:"note"`
+		Weight   *int    `json:"weight"`
+		Disabled *bool   `json:"disabled"`
+	}
+	if err := readJSON(w, r, &body); err != nil {
+		writeJSONError(w, 400, "请求格式错误")
+		return
+	}
+	// Validate everything before writing anything: a rejected weight must not
+	// leave the note silently updated.
+	if body.Weight != nil {
+		if err := store.ValidateTokenWeight(*body.Weight); err != nil {
+			writeJSONError(w, 400, err.Error())
+			return
+		}
+	}
+	if err := a.store.PatchToken(id, store.TokenPatch{Note: body.Note, Weight: body.Weight, Disabled: body.Disabled}); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeJSONError(w, 404, "令牌不存在")
+			return
+		}
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (a *Admin) deleteToken(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		writeJSONError(w, 400, "缺少 id 参数")
+		return
+	}
+	if err := a.store.DeleteToken(id); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeJSONError(w, 404, "令牌不存在")
+			return
+		}
+		writeJSONError(w, 500, err.Error())
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "deleted"})
+}
+
+// handleTokenVerify re-checks one configured credential against the gateway and
+// installs the verdict on the pool entry. It is how a token that was disabled by
+// a transient auth outage comes back without being re-entered.
+func (a *Admin) handleTokenVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSONError(w, 405, "方法不允许")
+		return
+	}
+	id := r.URL.Query().Get("id")
+	tok, ok := a.store.GetToken(id)
+	if !ok {
+		writeJSONError(w, 404, "令牌不存在")
+		return
+	}
+	st, err := a.verifyPAT(r.Context(), tok.PAT)
+	if err != nil {
+		if e := a.poolEntry(id); e != nil {
+			e.MarkRejected("网关拒绝该令牌：" + err.Error())
+		}
+		writeJSONError(w, 400, "令牌校验失败："+err.Error())
+		return
+	}
+	if e := a.poolEntry(id); e != nil {
+		e.MarkVerified()
+	}
+	resp := map[string]interface{}{"status": "ok"}
+	if st != nil {
+		resp["plan"], resp["tag"] = st.Plan, st.UserTag
+	}
+	writeJSON(w, 200, resp)
+}
+
+func (a *Admin) poolEntry(id string) *bridge.PoolEntry {
+	if a.pool == nil {
+		return nil
+	}
+	return a.pool.Find(id)
+}
+
+// tokView renders a stored token with no live state attached — the shape the
+// add response returns before the account loop has fetched anything.
+func tokView(t store.Token) TokenView {
+	return TokenView{
+		ID: t.ID, PATMasked: maskPAT(t.PAT), Note: t.Note, Weight: t.Weight,
+		Disabled: t.Disabled, CreatedAt: t.CreatedAt, State: bridge.StateHealthy.String(),
 	}
 }
 
@@ -688,13 +940,17 @@ func atoiDefault(s string, def int) int {
 	return n
 }
 
-// maskPAT returns a masked version of the PAT for display.
+// maskPAT returns a masked version of the PAT for display. It slices by rune: a
+// note-free PAT is ASCII in practice, but a hand-edited value with multi-byte
+// characters must not come back as invalid UTF-8 (which JSON encoders turn into
+// U+FFFD and the browser renders as garbage).
 func maskPAT(pat string) string {
-	if len(pat) <= 8 {
-		if pat == "" {
-			return ""
-		}
+	r := []rune(pat)
+	if len(r) == 0 {
+		return ""
+	}
+	if len(r) <= 8 {
 		return "****"
 	}
-	return pat[:4] + "****" + pat[len(pat)-4:]
+	return string(r[:4]) + "****" + string(r[len(r)-4:])
 }

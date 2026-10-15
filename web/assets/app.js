@@ -61,7 +61,6 @@ function appShell(){
     logs:[], logTotal:0, logPage:1, logPageSize:20,
     logFilter:{model:'',key_id:'',status:''}, _logT:0,
     keyForm:{key:'',note:''}, keyModal:false,
-    pat:{masked:'',input:''},
     models:{models:[],loading:false},
     config:{}, pwForm:{current_password:'',new_password:''}, configHint:'',
     confirmBox:{open:false,title:'',message:'',detail:'',okText:'确定',danger:true,onOk:null},
@@ -95,6 +94,8 @@ function appShell(){
       // 统计页驻留时每 15 秒自动刷新（与旧面板的轮询节奏一致），离开页面或登出后停发；
       // 后台标签页跳过（visibilityState），回到前台时立即补一次，避免展示陈旧数据。
       setInterval(()=>{ if(this.loggedIn && this.view==='stats' && document.visibilityState==='visible') this.loadStats(); }, 15000);
+      // 令牌页驻留时每 20 秒刷新：账号的健康状态与额度由服务端后台循环更新，面板只需读缓存。
+      setInterval(()=>{ if(this.loggedIn && this.view==='token' && document.visibilityState==='visible') this.loadTokens(); }, 20000);
       document.addEventListener('visibilitychange', ()=>{
         if(!document.hidden && this.loggedIn && this.view==='stats') this.loadStats();
       });

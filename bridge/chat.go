@@ -216,17 +216,12 @@ func (b *OpenAiBridge) HandleChat(ctx context.Context, w http.ResponseWriter, re
 	}
 	if hasImages {
 		if !catalog.VisionModels[openaiModel] {
-			supported := ""
-			visionList := make([]string, 0)
+			visionList := make([]string, 0, len(catalog.VisionModels))
 			for k := range catalog.VisionModels {
 				visionList = append(visionList, k)
 			}
 			sortStrings(visionList)
-			supported = strings.Join(visionList, ", ")
-			if supported == "" {
-				supported = "(none)"
-			}
-			return fmt.Errorf("Image input is not supported by model '%s'. Use one of: %s.", openaiModel, supported)
+			return &models.CapabilityError{Model: openaiModel, Supported: strings.Join(visionList, ", ")}
 		}
 		body.ModelConfig.IsVL = true
 		body.ChatContext.Extra.ModelConfig.IsVL = true

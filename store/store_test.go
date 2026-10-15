@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -64,17 +65,148 @@ func TestHostPortPersistence(t *testing.T) {
 	}
 }
 
-func TestPAT(t *testing.T) {
+func TestTokenPool(t *testing.T) {
 	s := tempStore(t)
-	if s.GetPAT() != "" {
-		t.Errorf("expected empty PAT, got %q", s.GetPAT())
+	if got := s.ListTokens(); len(got) != 0 {
+		t.Errorf("expected empty pool, got %d entries", len(got))
 	}
-	pat := "pt-test123"
-	if err := s.SetPAT(pat); err != nil {
-		t.Fatalf("SetPAT failed: %v", err)
+
+	first, err := s.AddToken("pt-one", "note one", 0)
+	if err != nil {
+		t.Fatalf("AddToken failed: %v", err)
 	}
-	if s.GetPAT() != pat {
-		t.Errorf("expected %q, got %q", pat, s.GetPAT())
+	if first.Weight != DefaultTokenWeight {
+		t.Errorf("weight = %d, want default %d", first.Weight, DefaultTokenWeight)
+	}
+	if _, err := s.AddToken("pt-two", "", 5); err != nil {
+		t.Fatalf("AddToken failed: %v", err)
+	}
+	if _, err := s.AddToken("pt-one", "", 1); !errors.Is(err, ErrDuplicateToken) {
+		t.Errorf("duplicate PAT err = %v, want ErrDuplicateToken", err)
+	}
+	if _, err := s.AddToken("  ", "", 1); err == nil {
+		t.Error("expected error for blank PAT")
+	}
+	if _, err := s.AddToken("pt-three", "", MaxTokenWeight+1); err == nil {
+		t.Error("expected error for out-of-range weight")
+	}
+
+	genBefore := s.TokensGen()
+	if err := s.PatchToken(first.ID, TokenPatch{Weight: ptrInt(3), Disabled: ptrBool(true)}); err != nil {
+		t.Fatalf("PatchToken failed: %v", err)
+	}
+	if s.TokensGen() == genBefore {
+		t.Error("TokensGen must increase after a pool mutation")
+	}
+	got, ok := s.GetToken(first.ID)
+	if !ok {
+		t.Fatalf("GetToken(%s) not found", first.ID)
+	}
+	if got.Weight != 3 || !got.Disabled {
+		t.Errorf("patch not applied: weight=%d disabled=%v", got.Weight, got.Disabled)
+	}
+	// Re-enabling is a real request even though it is the zero value.
+	if err := s.PatchToken(first.ID, TokenPatch{Disabled: ptrBool(false)}); err != nil {
+		t.Fatalf("re-enable failed: %v", err)
+	}
+	if got, _ := s.GetToken(first.ID); got.Disabled {
+		t.Error("Disabled=false patch was ignored")
+	}
+	if err := s.PatchToken(first.ID, TokenPatch{Weight: ptrInt(0)}); err == nil {
+		t.Error("expected error for weight 0")
+	}
+	if err := s.PatchToken("nope", TokenPatch{Weight: ptrInt(2)}); err == nil {
+		t.Error("expected error for unknown token id")
+	}
+
+	if err := s.DeleteToken(first.ID); err != nil {
+		t.Fatalf("DeleteToken failed: %v", err)
+	}
+	if len(s.ListTokens()) != 1 {
+		t.Errorf("pool size = %d, want 1 after delete", len(s.ListTokens()))
+	}
+	if err := s.DeleteToken(first.ID); err == nil {
+		t.Error("expected error when deleting a missing token")
+	}
+}
+
+func ptrInt(n int) *int    { return &n }
+func ptrBool(b bool) *bool { return &b }
+
+// A pre-pool data.json carries one bare "pat"; loading it must yield a
+// single-entry pool and rewrite the file without the legacy field, so the
+// secret keeps exactly one home on disk.
+func TestLegacyPATMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	raw := `{"host":"127.0.0.1","port":10081,"pat":"pt-legacy","password":"password","api_keys":[]}`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	tokens := s.ListTokens()
+	if len(tokens) != 1 {
+		t.Fatalf("pool size = %d, want 1", len(tokens))
+	}
+	if tokens[0].PAT != "pt-legacy" {
+		t.Errorf("migrated PAT = %q", tokens[0].PAT)
+	}
+	if tokens[0].ID == "" {
+		t.Error("migrated token has no ID")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	var disk map[string]any
+	if err := json.Unmarshal(after, &disk); err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+	if _, ok := disk["pat"]; ok {
+		t.Error("legacy pat key survived the migration")
+	}
+	if _, ok := disk["tokens"]; !ok {
+		t.Error("tokens key not persisted")
+	}
+}
+
+// Hand-edited files must not be able to smuggle in an empty entry, a weight of
+// zero, or the same PAT twice.
+func TestSanitizeTokensOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.json")
+	raw := `{"host":"127.0.0.1","port":10081,"password":"password","api_keys":[],"tokens":[` +
+		`{"id":"","pat":"  ","note":"blank","weight":9999},` +
+		`{"id":"a","pat":"pt-dup","weight":0},` +
+		`{"id":"b","pat":"pt-dup","weight":2},` +
+		`{"id":"c","pat":"pt-keep","weight":-5}]}`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	s, err := New(path)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+	tokens := s.ListTokens()
+	if len(tokens) != 2 {
+		t.Fatalf("pool size = %d, want 2 (blank + duplicate dropped): %+v", len(tokens), tokens)
+	}
+	for _, tk := range tokens {
+		if tk.Weight < MinTokenWeight || tk.Weight > MaxTokenWeight {
+			t.Errorf("%s weight = %d, out of range", tk.ID, tk.Weight)
+		}
+		if tk.ID == "" {
+			t.Errorf("entry %q has no ID", tk.PAT)
+		}
+	}
+	if tokens[1].ID != "c" || tokens[1].Weight != DefaultTokenWeight {
+		t.Errorf("unexpected survivor: %+v", tokens[1])
 	}
 }
 
@@ -163,14 +295,15 @@ func TestPersistence(t *testing.T) {
 
 	s1, _ := New(path)
 	s1.AddKey("sk-persist", "persist note")
-	s1.SetPAT("pt-persist")
+	s1.AddToken("pt-persist", "", 0)
 
 	s2, err := New(path)
 	if err != nil {
 		t.Fatalf("reload failed: %v", err)
 	}
-	if s2.GetPAT() != "pt-persist" {
-		t.Errorf("expected persisted PAT 'pt-persist', got %q", s2.GetPAT())
+	tokens := s2.ListTokens()
+	if len(tokens) != 1 || tokens[0].PAT != "pt-persist" {
+		t.Errorf("expected persisted PAT 'pt-persist', got %+v", tokens)
 	}
 	if !s2.ValidateKey("sk-persist") {
 		t.Error("expected persisted key to be valid")
@@ -234,7 +367,7 @@ func TestFilePermissions(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "data.json")
 	s, _ := New(path)
-	s.SetPAT("pt-secret")
+	s.AddToken("pt-secret", "", 0)
 
 	info, err := os.Stat(path)
 	if err != nil {

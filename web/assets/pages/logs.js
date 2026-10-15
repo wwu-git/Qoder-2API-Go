@@ -21,6 +21,17 @@ PAGE('logs', {
     }catch(e){ this.toast(e.message,'err'); }
   },
 
+  /* 降级链路：一次请求 touched 多个账号时（首次尝试失败且响应还没发出），把每一次
+     尝试摊开在鼠标悬停里——操作员需要知道额度是在几个账号上花掉的。 */
+  attemptsTip(l){
+    const a = l.attempts || [];
+    if(a.length < 2) return '';
+    return '账号轮换：' + a.map((x,i)=>{
+      const name = x.note || x.token_id || '未知账号';
+      return '#' + (i+1) + ' ' + name + ' ' + (x.ok ? '成功' : '失败：' + (x.error || '未知原因'));
+    }).join(' → ');
+  },
+
   /* ── 进场：本页所需数据（realtime：进入即刷新，见 app.js enter()） ── */
   load(){ this.loadKeys(); this.loadLogs(1); },
 });

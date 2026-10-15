@@ -168,11 +168,6 @@ PAGE('stats', {
     const acct = (this.stats||{}).account;
     return !!(acct && acct.is_quota_exceeded);
   },
-  /* 账号等级徽标（Free / Teams…）：渲染在「令牌」页，数据仍取自本统计快照 */
-  get accountTag(){
-    const acct = (this.stats||{}).account;
-    return (acct && acct.tag) ? acct.tag : '';
-  },
 
   async loadStats(){
     try{

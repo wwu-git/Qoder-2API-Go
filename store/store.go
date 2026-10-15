@@ -1,5 +1,5 @@
-// Package store provides JSON file-based persistence for API keys
-// and PAT token.
+// Package store provides JSON file-based persistence for API keys and the
+// upstream PAT pool.
 package store
 
 import (
@@ -10,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"qoder2api/logs"
@@ -20,6 +22,10 @@ import (
 // ErrDuplicateKey is returned by AddKey when an identical key already exists.
 var ErrDuplicateKey = errors.New("api key already exists")
 
+// ErrDuplicateToken is returned by AddToken when the same PAT is already in
+// the pool.
+var ErrDuplicateToken = errors.New("pat already exists")
+
 // APIKey represents a single API key entry.
 type APIKey struct {
 	ID        string `json:"id"`
@@ -28,14 +34,67 @@ type APIKey struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+// Token is one upstream Qoder PAT in the pool. Each token is a separate
+// account: its own session, its own concurrency slots, its own quota and
+// billing cycle.
+type Token struct {
+	ID        string `json:"id"`
+	PAT       string `json:"pat"`
+	Note      string `json:"note"`
+	Weight    int    `json:"weight"`
+	Disabled  bool   `json:"disabled,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// TokenPatch carries the editable fields of a pool entry. Pointers distinguish
+// "leave alone" from "set to the zero value" (a weight of 0 is invalid, but
+// Disabled=false is a real request to re-enable an entry).
+type TokenPatch struct {
+	Note     *string
+	Weight   *int
+	Disabled *bool
+}
+
+// Weight bounds. The weight is a relative share of traffic, not a percentage,
+// so it stays small and the picker's arithmetic cannot overflow.
+const (
+	DefaultTokenWeight = 1
+	MinTokenWeight     = 1
+	MaxTokenWeight     = 100
+)
+
+// ValidateTokenWeight checks that n is a usable relative traffic share.
+func ValidateTokenWeight(n int) error {
+	if n < MinTokenWeight || n > MaxTokenWeight {
+		return fmt.Errorf("权重需在 %d-%d 之间", MinTokenWeight, MaxTokenWeight)
+	}
+	return nil
+}
+
+// normalizeWeight maps an unusable weight (0 in a hand-edited file, or an
+// out-of-range one) onto the nearest valid value instead of rejecting the file.
+func normalizeWeight(n int) int {
+	if n < MinTokenWeight {
+		return DefaultTokenWeight
+	}
+	if n > MaxTokenWeight {
+		return MaxTokenWeight
+	}
+	return n
+}
+
 // Config is the on-disk JSON structure.
 type Config struct {
-	Host     string      `json:"host"`
-	Port     int         `json:"port"`
-	PAT      string      `json:"pat"`
-	Password string      `json:"password"`
-	APIKeys  []APIKey    `json:"api_keys"`
-	Stats    *stats.Data `json:"stats,omitempty"`
+	Host     string   `json:"host"`
+	Port     int      `json:"port"`
+	Password string   `json:"password"`
+	APIKeys  []APIKey `json:"api_keys"`
+	// Tokens is the upstream PAT pool. LegacyPAT is read once at load time to
+	// migrate a pre-pool data.json into a single-entry pool; it is never
+	// written back, so the pool stays the only copy of the secret on disk.
+	LegacyPAT string      `json:"pat,omitempty"`
+	Tokens    []Token     `json:"tokens"`
+	Stats     *stats.Data `json:"stats,omitempty"`
 	// Logs is the persisted request-log ring (metadata only), flushed out of
 	// band by the logs recorder — the JSON equivalent of Buddy-2API's logs
 	// table.
@@ -110,6 +169,10 @@ type Store struct {
 	mu       sync.RWMutex
 	filePath string
 	config   *Config
+	// tokensGen counts pool mutations. Bridge-side pool reconciliation compares
+	// it instead of diffing token slices, so a PAT never leaves the store on the
+	// hot path and a hand-edited file is picked up as soon as it is loaded.
+	tokensGen atomic.Int64
 }
 
 // New creates a Store backed by the given file path.
@@ -125,6 +188,7 @@ func New(filePath string) (*Store, error) {
 			LogRetentionDays:   DefaultLogRetentionDays,
 			LogMaxEntries:      DefaultLogMaxEntries,
 			APIKeys:            []APIKey{},
+			Tokens:             []Token{},
 		},
 	}
 	if err := s.load(); err != nil {
@@ -191,7 +255,27 @@ func (s *Store) load() error {
 		cfg.IdleTimeoutSeconds = MaxIdleTimeoutSeconds
 		needsSave = true
 	}
+	tokens, tokensFixed := sanitizeTokens(cfg.Tokens)
+	// One-time migration: a pre-pool data.json carries the single PAT in "pat".
+	// It becomes the pool's first entry, and the legacy field is dropped so the
+	// secret has exactly one home on disk.
+	if cfg.LegacyPAT != "" {
+		tokens = append(tokens, Token{
+			PAT:       cfg.LegacyPAT,
+			Note:      "原单账号",
+			Weight:    DefaultTokenWeight,
+			CreatedAt: time.Now().Unix(),
+		})
+		cfg.LegacyPAT = ""
+		tokens, tokensFixed = sanitizeTokens(tokens)
+		needsSave = true
+	}
+	if len(tokens) != len(cfg.Tokens) || tokensFixed {
+		needsSave = true
+	}
+	cfg.Tokens = tokens
 	s.config = &cfg
+	s.tokensGen.Store(1)
 	// Persist migrated defaults so the file stays in sync
 	if needsSave {
 		return s.saveLocked()
@@ -327,19 +411,161 @@ func (s *Store) SetPassword(password string) error {
 	return s.save()
 }
 
-// --- PAT ---
+// --- Token pool ---
 
-func (s *Store) GetPAT() string {
+// ListTokens returns a copy of the pool in config order. The PAT material is
+// included: callers are the bridge-side pool (which signs requests) and the
+// admin API (which masks it before answering).
+func (s *Store) ListTokens() []Token {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.config.PAT
+	out := make([]Token, len(s.config.Tokens))
+	copy(out, s.config.Tokens)
+	return out
 }
 
-func (s *Store) SetPAT(pat string) error {
+// TokensGen returns the pool's mutation generation. It only ever increases.
+func (s *Store) TokensGen() int64 { return s.tokensGen.Load() }
+
+// AddToken appends a PAT to the pool. An empty weight selects the default.
+// Returns ErrDuplicateToken when the same PAT is already configured.
+func (s *Store) AddToken(pat, note string, weight int) (*Token, error) {
+	pat = strings.TrimSpace(pat)
+	if pat == "" {
+		return nil, fmt.Errorf("令牌不能为空")
+	}
+	if weight == 0 {
+		weight = DefaultTokenWeight
+	}
+	if err := ValidateTokenWeight(weight); err != nil {
+		return nil, err
+	}
+	id, err := GenerateID()
+	if err != nil {
+		return nil, fmt.Errorf("generate id: %w", err)
+	}
+	entry := &Token{
+		ID:        id,
+		PAT:       pat,
+		Note:      strings.TrimSpace(note),
+		Weight:    weight,
+		CreatedAt: time.Now().Unix(),
+	}
 	s.mu.Lock()
-	s.config.PAT = pat
+	for _, t := range s.config.Tokens {
+		if t.PAT == pat {
+			s.mu.Unlock()
+			return nil, ErrDuplicateToken
+		}
+	}
+	s.config.Tokens = append(s.config.Tokens, *entry)
 	s.mu.Unlock()
-	return s.save()
+	if err := s.save(); err != nil {
+		return nil, err
+	}
+	s.tokensGen.Add(1)
+	return entry, nil
+}
+
+// PatchToken applies a partial update to the pool entry with the given ID.
+func (s *Store) PatchToken(id string, p TokenPatch) error {
+	s.mu.Lock()
+	found := false
+	for i := range s.config.Tokens {
+		if s.config.Tokens[i].ID != id {
+			continue
+		}
+		found = true
+		if p.Note != nil {
+			s.config.Tokens[i].Note = strings.TrimSpace(*p.Note)
+		}
+		if p.Weight != nil {
+			if err := ValidateTokenWeight(*p.Weight); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			s.config.Tokens[i].Weight = *p.Weight
+		}
+		if p.Disabled != nil {
+			s.config.Tokens[i].Disabled = *p.Disabled
+		}
+		break
+	}
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("token not found: %s", id)
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	s.tokensGen.Add(1)
+	return nil
+}
+
+// DeleteToken removes the pool entry with the given ID.
+func (s *Store) DeleteToken(id string) error {
+	s.mu.Lock()
+	found := false
+	filtered := s.config.Tokens[:0]
+	for _, t := range s.config.Tokens {
+		if t.ID == id {
+			found = true
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+	s.config.Tokens = filtered
+	s.mu.Unlock()
+	if !found {
+		return fmt.Errorf("token not found: %s", id)
+	}
+	if err := s.save(); err != nil {
+		return err
+	}
+	s.tokensGen.Add(1)
+	return nil
+}
+
+// GetToken returns the pool entry with the given ID.
+func (s *Store) GetToken(id string) (Token, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, t := range s.config.Tokens {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return Token{}, false
+}
+
+// sanitizeTokens repairs a pool read from disk: blank out unusable entries,
+// clamp weights, fill in missing IDs and drop duplicate PATs. It reports
+// whether anything was changed so the caller can decide to persist the fix.
+func sanitizeTokens(in []Token) ([]Token, bool) {
+	changed := false
+	seen := make(map[string]bool, len(in))
+	out := make([]Token, 0, len(in))
+	for _, t := range in {
+		t.PAT = strings.TrimSpace(t.PAT)
+		if t.PAT == "" || seen[t.PAT] {
+			changed = true
+			continue
+		}
+		seen[t.PAT] = true
+		if w := normalizeWeight(t.Weight); w != t.Weight {
+			t.Weight, changed = w, true
+		}
+		if t.ID == "" {
+			if id, err := GenerateID(); err == nil {
+				t.ID, changed = id, true
+			}
+		}
+		if t.CreatedAt == 0 {
+			t.CreatedAt, changed = time.Now().Unix(), true
+		}
+		out = append(out, t)
+	}
+	return out, changed
 }
 
 // --- Stats ---

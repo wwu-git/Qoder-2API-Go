@@ -18,6 +18,8 @@ type LogEntry struct {
 	ID               int64   `json:"id"`
 	KeyID            string  `json:"key_id,omitempty"`
 	KeyNote          string  `json:"key_note,omitempty"`
+	TokenID          string  `json:"token_id,omitempty"`
+	TokenNote        string  `json:"token_note,omitempty"`
 	Model            string  `json:"model,omitempty"`
 	Stream           bool    `json:"stream,omitempty"`
 	PromptTokens     int     `json:"prompt_tokens,omitempty"`
@@ -27,7 +29,22 @@ type LogEntry struct {
 	DurationMs       int64   `json:"duration_ms,omitempty"`
 	StatusCode       int     `json:"status_code,omitempty"`
 	ErrorMsg         string  `json:"error_msg,omitempty"`
-	CreatedAt        int64   `json:"created_at"`
+	// Attempts records every upstream try the token pool made for this request.
+	// A single attempt is the normal case and stays unlisted; more than one is
+	// the failover trail, and the client needs to see that credits were spent
+	// on more than one account.
+	Attempts  []Attempt `json:"attempts,omitempty"`
+	CreatedAt int64     `json:"created_at"`
+}
+
+// Attempt is one upstream try against one account, named by token ID and note
+// only — never by its credential.
+type Attempt struct {
+	TokenID    string `json:"token_id"`
+	Note       string `json:"note,omitempty"`
+	OK         bool   `json:"ok"`
+	Error      string `json:"error,omitempty"`
+	DurationMs int64  `json:"duration_ms"`
 }
 
 // Filter is a log query. Model matches as a substring, KeyID exactly. For

@@ -3,13 +3,16 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"qoder2api/auth"
+	"qoder2api/bridge"
 	"qoder2api/logs"
 	"qoder2api/models"
 	"qoder2api/stats"
@@ -27,12 +30,40 @@ func tempStore(t *testing.T) *store.Store {
 	return s
 }
 
+// stubVerify is the gateway's answer for a credential a test is happy with.
+// Tests that need the rejection path replace Admin.verifyPAT with their own.
+func stubVerify(ctx context.Context, pat string) (*auth.AccountStatus, error) {
+	return &auth.AccountStatus{Plan: "PLAN_TIER_PRO", UserTag: "Pro"}, nil
+}
+
+// testTokenSource is the store→pool config adapter the server wires in main.
+func testTokenSource(s *store.Store) bridge.ConfigSource {
+	return func() ([]bridge.TokenConfig, int64) {
+		tokens := s.ListTokens()
+		out := make([]bridge.TokenConfig, 0, len(tokens))
+		for _, tk := range tokens {
+			out = append(out, bridge.TokenConfig{
+				ID: tk.ID, PAT: tk.PAT, Note: tk.Note, Weight: tk.Weight, Disabled: tk.Disabled,
+			})
+		}
+		return out, s.TokensGen()
+	}
+}
+
+func newAdminWithStore(t *testing.T, s *store.Store, pool *bridge.Pool) *Admin {
+	t.Helper()
+	mf := func(ctx context.Context) []string { return models.DefaultCatalog().Keys() }
+	a := New(s, mf, nil, nil, pool)
+	// The token endpoints verify a credential against the gateway before saving
+	// it; a test has no gateway to ask, so the default says "accepted". Tests
+	// needing the rejection path overwrite this.
+	a.verifyPAT = stubVerify
+	return a
+}
+
 func newAdmin(t *testing.T) (*Admin, *store.Store) {
 	s := tempStore(t)
-	mf := func(ctx context.Context) []string {
-		return models.DefaultCatalog().Keys()
-	}
-	return New(s, mf, nil, nil), s
+	return newAdminWithStore(t, s, nil), s
 }
 
 func doRequest(t *testing.T, handler http.HandlerFunc, method, path string, body interface{}) *httptest.ResponseRecorder {
@@ -96,29 +127,210 @@ func TestDeleteKeyMissingID(t *testing.T) {
 	}
 }
 
-// -- PAT --
+// -- Token pool --
 
-func TestPATSetAndGet(t *testing.T) {
+func TestTokenListMasksPAT(t *testing.T) {
+	a, s := newAdmin(t)
+	if _, err := s.AddToken("pt-test123456", "primary", 3); err != nil {
+		t.Fatalf("AddToken: %v", err)
+	}
+	w := doRequest(t, a.handleTokens, "GET", "/admin/api/tokens", nil)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// The plaintext PAT must never leave the server; the panel edits by
+	// replacing an account, never in place.
+	if strings.Contains(w.Body.String(), "pt-test123456") {
+		t.Error("response leaks the plaintext PAT")
+	}
+	var resp struct {
+		Tokens []TokenView `json:"tokens"`
+		Total  int         `json:"total"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Total != 1 || len(resp.Tokens) != 1 {
+		t.Fatalf("tokens = %+v, want one entry", resp.Tokens)
+	}
+	got := resp.Tokens[0]
+	if got.PATMasked != "pt-t****3456" {
+		t.Errorf("pat_masked = %q, want pt-t****3456", got.PATMasked)
+	}
+	if got.Weight != 3 || got.Note != "primary" {
+		t.Errorf("weight/note = %d/%q, want 3/primary", got.Weight, got.Note)
+	}
+	if got.State != "healthy" {
+		t.Errorf("state = %q, want healthy", got.State)
+	}
+}
+
+// The credential is checked against the gateway before it is persisted: an
+// account the gateway refuses must not enter the pool (it would otherwise be
+// picked by the round-robin and cost the client a failed rotation).
+func TestAddTokenRejectsUnverifiedPAT(t *testing.T) {
+	a, s := newAdmin(t)
+	a.verifyPAT = func(ctx context.Context, pat string) (*auth.AccountStatus, error) {
+		return nil, errors.New("HTTP 401 personal token is invalid")
+	}
+	w := doRequest(t, a.handleTokens, "POST", "/admin/api/tokens", map[string]string{"pat": "pt-bad"})
+	if w.Code != 400 {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "未保存") {
+		t.Errorf("response should say nothing was saved: %s", w.Body.String())
+	}
+	if len(s.ListTokens()) != 0 {
+		t.Errorf("rejected PAT must not be persisted, pool = %+v", s.ListTokens())
+	}
+}
+
+func TestAddTokenStoresVerifiedPAT(t *testing.T) {
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleTokens, "POST", "/admin/api/tokens", map[string]interface{}{
+		"pat": "pt-good-token-1", "note": "备份账号", "weight": 5,
+	})
+	if w.Code != 201 {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	tokens := s.ListTokens()
+	if len(tokens) != 1 {
+		t.Fatalf("tokens = %+v, want one entry", tokens)
+	}
+	if tokens[0].PAT != "pt-good-token-1" || tokens[0].Weight != 5 || tokens[0].Note != "备份账号" {
+		t.Errorf("stored token = %+v", tokens[0])
+	}
+	// A duplicate is refused without spending a verification round trip.
+	a.verifyPAT = func(ctx context.Context, pat string) (*auth.AccountStatus, error) {
+		t.Error("duplicate must be rejected before verifying")
+		return nil, nil
+	}
+	w = doRequest(t, a.handleTokens, "POST", "/admin/api/tokens", map[string]string{"pat": "pt-good-token-1"})
+	if w.Code != 409 {
+		t.Errorf("duplicate = %d, want 409: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestAddTokenInvalidInput(t *testing.T) {
+	a, s := newAdmin(t)
+	w := doRequest(t, a.handleTokens, "POST", "/admin/api/tokens", map[string]string{"pat": "   "})
+	if w.Code != 400 {
+		t.Errorf("blank PAT = %d, want 400", w.Code)
+	}
+	w = doRequest(t, a.handleTokens, "POST", "/admin/api/tokens", map[string]interface{}{"pat": "pt-x", "weight": 999})
+	if w.Code != 400 {
+		t.Errorf("out-of-range weight = %d, want 400", w.Code)
+	}
+	if len(s.ListTokens()) != 0 {
+		t.Error("invalid requests must not persist anything")
+	}
+}
+
+func TestPatchTokenFields(t *testing.T) {
+	a, s := newAdmin(t)
+	created, err := s.AddToken("pt-patch-me", "old note", 1)
+	if err != nil {
+		t.Fatalf("AddToken: %v", err)
+	}
+	w := doRequest(t, a.handleTokens, "PUT", "/admin/api/tokens?id="+created.ID, map[string]interface{}{
+		"note": "new note", "weight": 7, "disabled": true,
+	})
+	if w.Code != 200 {
+		t.Fatalf("patch = %d: %s", w.Code, w.Body.String())
+	}
+	got, _ := s.GetToken(created.ID)
+	if got.Note != "new note" || got.Weight != 7 || !got.Disabled {
+		t.Errorf("token after patch = %+v", got)
+	}
+	// disabled=false is a real request to re-enable, not "field omitted".
+	w = doRequest(t, a.handleTokens, "PUT", "/admin/api/tokens?id="+created.ID, map[string]interface{}{"disabled": false})
+	if w.Code != 200 {
+		t.Fatalf("re-enable = %d: %s", w.Code, w.Body.String())
+	}
+	if got, _ = s.GetToken(created.ID); got.Disabled {
+		t.Error("disabled=false ignored")
+	}
+
+	w = doRequest(t, a.handleTokens, "PUT", "/admin/api/tokens?id="+created.ID, map[string]interface{}{"weight": 0})
+	if w.Code != 400 {
+		t.Errorf("bad weight = %d, want 400", w.Code)
+	}
+	if got, _ = s.GetToken(created.ID); got.Weight != 7 {
+		t.Errorf("rejected patch changed weight to %d", got.Weight)
+	}
+	w = doRequest(t, a.handleTokens, "PUT", "/admin/api/tokens", map[string]interface{}{"weight": 2})
+	if w.Code != 400 {
+		t.Errorf("missing id = %d, want 400", w.Code)
+	}
+	w = doRequest(t, a.handleTokens, "PUT", "/admin/api/tokens?id=nope", map[string]interface{}{"weight": 2})
+	if w.Code != 404 {
+		t.Errorf("unknown id = %d, want 404", w.Code)
+	}
+}
+
+func TestDeleteToken(t *testing.T) {
+	a, s := newAdmin(t)
+	created, _ := s.AddToken("pt-delete-me", "", 1)
+	w := doRequest(t, a.handleTokens, "DELETE", "/admin/api/tokens?id="+created.ID, nil)
+	if w.Code != 200 {
+		t.Fatalf("delete = %d: %s", w.Code, w.Body.String())
+	}
+	if len(s.ListTokens()) != 0 {
+		t.Error("token survived delete")
+	}
+	w = doRequest(t, a.handleTokens, "DELETE", "/admin/api/tokens?id="+created.ID, nil)
+	if w.Code != 404 {
+		t.Errorf("second delete = %d, want 404", w.Code)
+	}
+}
+
+// Re-verifying is how an account that a transient auth outage disabled comes
+// back without being re-entered.
+func TestVerifyTokenClearsRejection(t *testing.T) {
+	s := tempStore(t)
+	pool := bridge.NewPool(testTokenSource(s))
+	a := newAdminWithStore(t, s, pool)
+	created, err := s.AddToken("pt-verify", "", 1)
+	if err != nil {
+		t.Fatalf("AddToken: %v", err)
+	}
+	e := pool.Find(created.ID)
+	if e == nil {
+		t.Fatal("pool did not reconcile the stored token")
+	}
+	e.MarkRejected("网关拒绝该令牌：HTTP 401")
+
+	w := doRequest(t, a.handleTokenVerify, "POST", "/admin/api/tokens/verify?id="+created.ID, nil)
+	if w.Code != 200 {
+		t.Fatalf("verify = %d: %s", w.Code, w.Body.String())
+	}
+	if st := e.Status(); st.State != bridge.StateHealthy {
+		t.Errorf("state after verify = %s, want healthy", st.State)
+	}
+
+	// A credential the gateway still refuses stays disabled and reports why.
+	a.verifyPAT = func(ctx context.Context, pat string) (*auth.AccountStatus, error) {
+		return nil, errors.New("HTTP 401 personal token is invalid")
+	}
+	w = doRequest(t, a.handleTokenVerify, "POST", "/admin/api/tokens/verify?id="+created.ID, nil)
+	if w.Code != 400 {
+		t.Errorf("failed verify = %d, want 400", w.Code)
+	}
+	if st := e.Status(); st.State != bridge.StateDisabled || st.Reason == "" {
+		t.Errorf("state after failed verify = %s/%q, want disabled with a reason", st.State, st.Reason)
+	}
+
+	w = doRequest(t, a.handleTokenVerify, "POST", "/admin/api/tokens/verify?id=missing", nil)
+	if w.Code != 404 {
+		t.Errorf("unknown id = %d, want 404", w.Code)
+	}
+}
+
+func TestTokensEndpointMethodNotAllowed(t *testing.T) {
 	a, _ := newAdmin(t)
-	w := doRequest(t, a.handlePAT, "POST", "/admin/api/pat", map[string]string{"pat": "pt-test123"})
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	w = doRequest(t, a.handlePAT, "GET", "/admin/api/pat", nil)
-	if w.Code != 200 {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-	// The plaintext PAT must never appear in the response; only the masked form.
-	if strings.Contains(w.Body.String(), "pt-test123") {
-		t.Error("response must not leak the plaintext PAT")
-	}
-	var resp map[string]string
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if _, ok := resp["pat"]; ok {
-		t.Error("response must not contain a 'pat' field")
-	}
-	if resp["pat_masked"] != "pt-t****t123" {
-		t.Errorf("expected masked PAT, got %q", resp["pat_masked"])
+	w := doRequest(t, a.handleTokens, "PATCH", "/admin/api/tokens", map[string]string{})
+	if w.Code != 405 {
+		t.Errorf("expected 405, got %d", w.Code)
 	}
 }
 
@@ -131,11 +343,17 @@ func TestMaskPAT(t *testing.T) {
 		{"short", "****"},
 		{"pt-12345678", "pt-1****5678"},
 		{"pt-very-long-token-here", "pt-v****here"},
+		// A hand-edited note-free value with multi-byte characters must stay
+		// valid UTF-8: byte slicing "pt-" + a CJK run would emit U+FFFD.
+		{"令牌abc令牌abc令牌", "令牌ab****bc令牌"},
 	}
 	for _, tt := range tests {
 		got := maskPAT(tt.input)
 		if got != tt.expected {
 			t.Errorf("maskPAT(%q) = %q, want %q", tt.input, got, tt.expected)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("maskPAT(%q) produced invalid UTF-8: %q", tt.input, got)
 		}
 	}
 }
@@ -223,7 +441,7 @@ func TestStatsEndpoint(t *testing.T) {
 	rec.Record("Qwen3.7-Max", true)
 	rec.Record("Qwen3.7-Max", false)
 	rec.Record("DeepSeek-V4-Pro", true)
-	a := New(s, mf, rec, nil)
+	a := New(s, mf, rec, nil, nil)
 
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
 	if w.Code != 200 {
@@ -517,7 +735,7 @@ func TestStatsEndpointExposesBillingCycle(t *testing.T) {
 	})
 	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{PromptTokens: 5, Credits: 1.25})
 
-	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
 
 	var resp struct {
@@ -574,7 +792,7 @@ func TestStatsEndpointExposesCreditBreakdown(t *testing.T) {
 	rec.RecordUsage("Kimi-K2.7-Code", &stats.Usage{Credits: 3})
 	rec.RecordUsage("Kimi-K2.7-Code", &stats.Usage{Credits: 9, NonBillable: true})
 
-	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
 
 	var resp struct {
@@ -648,7 +866,7 @@ func TestStatsEndpointBillingCycleUnknown(t *testing.T) {
 	rec := stats.NewRecorder(nil)
 	rec.RecordUsage("Qwen3.7-Max", &stats.Usage{Credits: 2})
 
-	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil)
+	a := New(tempStore(t), func(ctx context.Context) []string { return nil }, rec, nil, nil)
 	w := doRequest(t, a.handleStats, "GET", "/admin/api/stats", nil)
 
 	var resp struct {
@@ -678,7 +896,7 @@ func TestLogsEndpoint(t *testing.T) {
 	rec := logs.NewRecorder(nil, 90, 2000)
 	rec.Record(&logs.LogEntry{KeyID: "k1", KeyNote: "dev", Model: "Qwen3.7-Max", StatusCode: 200, TotalTokens: 42})
 	rec.Record(&logs.LogEntry{KeyID: "k2", Model: "DeepSeek-V4-Pro", StatusCode: 502, ErrorMsg: "upstream: boom"})
-	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec)
+	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec, nil)
 
 	w := doRequest(t, a.handleLogs, "GET", "/admin/api/logs", nil)
 	if w.Code != 200 {
@@ -714,7 +932,7 @@ func TestLogsEndpointFilters(t *testing.T) {
 	rec.Record(&logs.LogEntry{KeyID: "k1", Model: "Qwen3.7-Max", StatusCode: 200})
 	rec.Record(&logs.LogEntry{KeyID: "k2", Model: "Qwen3.7-Max", StatusCode: 429, ErrorMsg: "busy"})
 	rec.Record(&logs.LogEntry{KeyID: "k1", Model: "DeepSeek-V4-Pro", StatusCode: 200})
-	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec)
+	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec, nil)
 
 	get := func(qs string) int {
 		w := doRequest(t, a.handleLogs, "GET", "/admin/api/logs"+qs, nil)
@@ -772,7 +990,7 @@ func TestLogsEndpointMethodNotAllowed(t *testing.T) {
 
 func TestLogsRequireAuth(t *testing.T) {
 	s := tempStore(t)
-	a := New(s, nil, nil, nil)
+	a := New(s, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	a.RegisterRoutes(mux)
 
@@ -825,7 +1043,7 @@ func TestConfigLogLimitsHotApplyToRecorder(t *testing.T) {
 	for i := 0; i < logs.MinMaxEntries+20; i++ {
 		rec.Record(&logs.LogEntry{Model: "m", CreatedAt: time.Now().Unix()})
 	}
-	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec)
+	a := New(s, func(ctx context.Context) []string { return nil }, nil, rec, nil)
 	w := doRequest(t, a.handleConfig, "POST", "/admin/api/config", map[string]interface{}{
 		"host": "", "port": 0, "log_max_entries": logs.MinMaxEntries,
 	})

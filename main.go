@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"qoder2api/admin"
@@ -28,117 +29,208 @@ import (
 // -ldflags "-X main.Version=v1.2.3". It is only used for display (login page).
 var Version = "dev"
 
-// bridgeProvider manages a single OpenAiBridge for the current PAT.
-// When the PAT changes (via admin UI), the bridge is recreated on next access.
-type bridgeProvider struct {
-	mu     sync.Mutex
-	bridge *bridge.OpenAiBridge
-	pat    string
-	store  *store.Store
-	// onPatChange is fired after a different non-empty PAT was replaced or the
-	// PAT was cleared. It runs without the provider lock held: the callback
-	// takes the recorder lock, and nesting the two risks a lock-order stall.
-	onPatChange func()
-}
-
-func newBridgeProvider(st *store.Store) *bridgeProvider {
-	return &bridgeProvider{store: st}
-}
-
-// setOnPatChange installs the callback fired when the configured PAT changes.
-// Wiring happens before the provider is used by any goroutine.
-func (p *bridgeProvider) setOnPatChange(fn func()) {
-	p.mu.Lock()
-	p.onPatChange = fn
-	p.mu.Unlock()
-}
-
-// resolveBridge validates the API key and returns the bridge for the current
-// PAT plus the key's metadata for request logging. Returns nil if the key is
-// invalid or no PAT is configured.
-func (p *bridgeProvider) resolveBridge(apiKey string) *bridge.ResolvedBridge {
-	key, ok := p.store.LookupKey(apiKey)
-	if !ok {
-		return nil
-	}
-	b := p.currentBridge()
-	if b == nil {
-		return nil
-	}
-	return &bridge.ResolvedBridge{Bridge: b, KeyID: key.ID, KeyNote: key.Note}
-}
-
-// currentBridge returns the bridge for the current PAT, creating or recreating
-// the bridge when the PAT changes. A PAT change (including clearing it) also
-// fires onPatChange after the provider lock is released, so the cached account
-// snapshot of the previous PAT can be dropped.
-func (p *bridgeProvider) currentBridge() *bridge.OpenAiBridge {
-	pat := p.store.GetPAT()
-	p.mu.Lock()
-	changed := p.pat != "" && p.pat != pat
-	var b *bridge.OpenAiBridge
-	if pat == "" {
-		if changed {
-			// The old PAT/session must not linger once it is cleared.
-			p.bridge = nil
-			p.pat = ""
+// tokenSource adapts the store to the bridge pool's config contract. The pool
+// reconciles on the generation counter, so the secret-bearing list is only
+// walked when the config actually changed.
+func tokenSource(st *store.Store) bridge.ConfigSource {
+	return func() ([]bridge.TokenConfig, int64) {
+		tokens := st.ListTokens()
+		out := make([]bridge.TokenConfig, 0, len(tokens))
+		for _, t := range tokens {
+			out = append(out, bridge.TokenConfig{
+				ID: t.ID, PAT: t.PAT, Note: t.Note, Weight: t.Weight, Disabled: t.Disabled,
+			})
 		}
-	} else if p.bridge == nil || p.pat != pat {
-		realPAT, region := auth.Resolve(pat)
-		p.bridge = bridge.NewOpenAiBridge(realPAT, region)
-		p.pat = pat
-		b = p.bridge
-	} else {
-		b = p.bridge
+		return out, st.TokensGen()
 	}
-	hook := p.onPatChange
-	p.mu.Unlock()
+}
 
-	if changed && hook != nil {
-		hook()
+// resolveAccess validates the client's API key and hands it the pool. A nil
+// result means the key itself is unknown; an empty pool is a different answer
+// and is reported by the pool as 503, never as a 401 against the client.
+func resolveAccess(st *store.Store, pool *bridge.Pool) bridge.BridgeResolver {
+	return func(apiKey string) *bridge.ResolvedAccess {
+		key, ok := st.LookupKey(apiKey)
+		if !ok {
+			return nil
+		}
+		return &bridge.ResolvedAccess{Pool: pool, KeyID: key.ID, KeyNote: key.Note}
 	}
-	return b
 }
 
 // accountRefreshCadence keeps the authoritative allowance reasonably fresh
 // without coupling the admin panel's 15-second poll to an upstream request.
 const accountRefreshCadence = time.Minute
 
-// patWriteMu serializes the recorder writes of the account loop against the
-// PAT-change clear. Without it, an in-flight refresh could pass its PAT
-// re-check, be preempted by an admin PAT change, and then write the previous
-// account's snapshot after the hook had already cleared it. The lock is never
-// held across the upstream fetch.
-var patWriteMu sync.Mutex
+// accountWriteMu serializes the recorder writes of the account loop against a
+// pool edit. The loop re-checks the pool generation after each fetch and drops a
+// snapshot that no longer matches the config, so a removed account cannot be
+// folded into the aggregate after the operator deleted it. The lock is never
+// held across an upstream fetch.
+var accountWriteMu sync.Mutex
 
-// applyAccountWrite persists one account snapshot under patWriteMu, re-checking
-// the PAT inside the lock so a snapshot belonging to a replaced or cleared PAT
-// can never be written. It returns false when the snapshot was dropped.
-func applyAccountWrite(rec *stats.Recorder, provider *bridgeProvider, pat string, nextResetMs int64, account *stats.Account) bool {
-	patWriteMu.Lock()
-	defer patWriteMu.Unlock()
-	if provider.store.GetPAT() != pat {
-		return false // the PAT changed while the fetch was in flight
+// refreshAccounts walks every account in the pool: it bootstraps or renews that
+// account's session, warms its model catalog, and pulls its authoritative quota
+// snapshot (which is also what takes an exhausted account out of rotation).
+//
+// The per-account snapshot stays on the bridge; the recorder only ever sees the
+// aggregate, because the panel shows one quota bar, not N of them.
+func refreshAccounts(ctx context.Context, pool *bridge.Pool, st *store.Store, rec *stats.Recorder) {
+	gen := st.TokensGen()
+	entries := pool.Entries()
+
+	if len(entries) == 0 {
+		accountWriteMu.Lock()
+		defer accountWriteMu.Unlock()
+		if st.TokensGen() == gen {
+			rec.ClearAccount()
+		}
+		return
 	}
-	rec.SetBillingCycle(nextResetMs)
-	rec.SetAccount(account)
-	return true
+
+	parts := make([]*auth.AccountStatus, 0, len(entries))
+	for _, e := range entries {
+		b := e.Bridge()
+		if b == nil {
+			continue
+		}
+		if status := b.EnsureAccountStatus(ctx); status != nil {
+			parts = append(parts, status)
+		}
+		// Warmed here so the request path never pays for a catalog fetch.
+		b.GetCatalog(ctx)
+	}
+
+	aggregate := aggregateAccounts(parts)
+	if aggregate == nil {
+		return // upstream unreachable: keep the last known state
+	}
+	accountWriteMu.Lock()
+	defer accountWriteMu.Unlock()
+	if st.TokensGen() != gen {
+		return // the pool was edited while these fetches were in flight
+	}
+	rec.SetBillingCycle(aggregate.NextResetMs)
+	rec.SetAccount(aggregate.Account)
 }
 
-// clearAccountOnPatChange drops the cached account snapshot when the configured
-// PAT changed. It shares patWriteMu with applyAccountWrite so the clear and the
-// writes are mutually exclusive.
-func clearAccountOnPatChange(rec *stats.Recorder) {
-	patWriteMu.Lock()
-	defer patWriteMu.Unlock()
-	rec.ClearAccount()
+// poolAggregate is the single quota view the statistics panel shows for the
+// whole pool, plus the billing-cycle anchor it counts down to: when several
+// accounts each have their own boundary, the earliest plausible one.
+type poolAggregate struct {
+	NextResetMs int64
+	Account     *stats.Account
+}
+
+// aggregateAccounts folds the per-account gateway snapshots into the single
+// quota view the statistics panel shows: allowances sum, the plan tag lists the
+// distinct tiers, and an account counts as exhausted only when every one of them
+// is. Missing snapshots are skipped rather than treated as zero.
+func aggregateAccounts(parts []*auth.AccountStatus) *poolAggregate {
+	if len(parts) == 0 {
+		return nil
+	}
+	agg := &poolAggregate{Account: &stats.Account{}}
+	var tags []string
+	allExhausted := true
+	for _, st := range parts {
+		if st == nil {
+			continue
+		}
+		if st.Plan != "" && agg.Account.Plan == "" {
+			agg.Account.Plan = st.Plan
+		}
+		if st.OrgName != "" && agg.Account.OrgName == "" {
+			agg.Account.OrgName = st.OrgName
+		}
+		if st.UserTag != "" && !containsStr(tags, st.UserTag) {
+			tags = append(tags, st.UserTag)
+		}
+		if !st.IsQuotaExceeded {
+			allExhausted = false
+		}
+		if r := minPlausibleReset(st.NextResetAtMs); r != 0 && (agg.NextResetMs == 0 || r < agg.NextResetMs) {
+			agg.NextResetMs = r
+		}
+		sumQuota(&agg.Account.UserQuota, st.UserQuota)
+		sumQuota(&agg.Account.AddOnQuota, st.AddOnQuota)
+		sumOrgPackage(&agg.Account.OrgResourcePackage, st.OrgResourcePackage)
+	}
+	agg.Account.IsQuotaExceeded = allExhausted
+	switch {
+	case len(tags) == 0:
+	case len(tags) == 1:
+		agg.Account.Tag = tags[0]
+	default:
+		agg.Account.Tag = strings.Join(tags, "/")
+	}
+	if q := agg.Account.UserQuota; q != nil && q.Total > 0 {
+		q.Percentage = q.Used / q.Total
+		agg.Account.TotalUsagePercentage = q.Percentage
+	}
+	return agg
+}
+
+// sumQuota adds one account's allowance bucket into the aggregate. Unit and
+// detail URL come from the first account that carries them: they are the same
+// product field for every account.
+func sumQuota(dst **stats.Quota, src *auth.Quota) {
+	if src == nil {
+		return
+	}
+	if *dst == nil {
+		*dst = &stats.Quota{Unit: src.Unit, DetailURL: src.DetailURL}
+	}
+	(*dst).Total += src.Total
+	(*dst).Used += src.Used
+	(*dst).Remaining += src.Remaining
+}
+
+// sumOrgPackage adds one account's view of the shared organization pool. The
+// gateway reports the same package to every member of an organization, so a
+// package seen on more than one account must not be double counted: the first
+// non-empty one wins.
+func sumOrgPackage(dst **stats.OrgResourcePackage, src *auth.OrgResourcePackage) {
+	if src == nil || *dst != nil {
+		return
+	}
+	*dst = &stats.OrgResourcePackage{
+		Used: src.Used, Cap: src.Cap, Remaining: src.Remaining,
+		Percentage: src.Percentage, Available: src.Available, Unit: src.Unit,
+	}
+}
+
+// minPlausibleReset returns ms when it is a real subscription boundary; the
+// gateway's far-future "never expires" sentinel must not become the panel's
+// countdown target.
+func minPlausibleReset(ms int64) int64 {
+	if ms > 0 && ms < maxPlausibleResetMs {
+		return ms
+	}
+	return 0
+}
+
+// maxPlausibleResetMs is 2100-01-01T00:00:00Z, matching the bridge-side bound.
+const maxPlausibleResetMs = int64(4102444800000)
+
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 // healthHandler serves an unauthenticated liveness/readiness probe. It is
 // deliberately cheap (no upstream calls, no session bootstrap): the body
-// carries readiness details (PAT configured, effective stream timeouts)
-// while the status stays 200 as long as the process is serving.
-func healthHandler(st *store.Store) http.HandlerFunc {
+// carries readiness details (how many tokens are configured and how many may
+// take traffic, plus the effective stream timeouts) while the status stays 200
+// as long as the process is serving.
+//
+// The pool counts come from cached state, not a probe: an unhealthy token makes
+// itself known here without this endpoint ever reaching the gateway.
+func healthHandler(pool *bridge.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
@@ -146,10 +238,16 @@ func healthHandler(st *store.Store) http.HandlerFunc {
 			return
 		}
 		timeouts := auth.CurrentStreamTimeouts()
+		tokens, available := pool.Len(), pool.Available()
+		status := "ok"
+		if tokens > 0 && available == 0 {
+			status = "degraded"
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":               "ok",
-			"has_pat":              st.GetPAT() != "",
+			"status":               status,
+			"tokens":               tokens,
+			"available_tokens":     available,
 			"chat_timeout_seconds": int(timeouts.Header.Seconds()),
 			"idle_timeout_seconds": int(timeouts.Idle.Seconds()),
 		})
@@ -221,7 +319,9 @@ func main() {
 		}
 	}
 
-	provider := newBridgeProvider(st)
+	// One bridge per configured PAT, selected by weight and failed over while
+	// the response is still uncommitted.
+	pool := bridge.NewPool(tokenSource(st))
 
 	// Request statistics recorder with periodic persistence (30s cadence).
 	// The loop also drains a stop channel so graceful shutdown can trigger a
@@ -230,14 +330,10 @@ func main() {
 	// Request-log recorder: same persistence model as stats (in-memory on the
 	// request path, flushed out of band). Entries are metadata only.
 	logRec := logs.NewRecorder(st, logRetention, logMaxEntries)
-	// A PAT change invalidates the previous account's plan and allowance; drop
-	// the cached snapshot so the panel cannot keep showing it. The clear shares
-	// patWriteMu with the account loop's writes.
-	provider.setOnPatChange(func() { clearAccountOnPatChange(rec) })
-	// The snapshot is persisted, so a restart with a different or cleared PAT
-	// would otherwise keep showing the previous account (the hook only fires on
-	// an in-process change). Drop it once here; the account loop repopulates the
-	// panel from the first successful refresh.
+	// The aggregate is persisted, so a restart after the pool was edited would
+	// otherwise keep showing an account that is no longer configured. Drop it
+	// once here; the account loop repopulates the panel from the first
+	// successful refresh.
 	rec.ClearAccount()
 	statsStop := make(chan struct{})
 	statsDone := make(chan struct{})
@@ -264,78 +360,32 @@ func main() {
 		}
 	}()
 
-	// Model fetcher for admin UI
+	// Model list for the admin panel: the union of the pool's catalogs.
 	modelFetcher := func(ctx context.Context) []string {
-		b := provider.currentBridge()
-		if b == nil {
+		if pool.Len() == 0 {
 			return models.DefaultCatalog().Keys()
 		}
-		catalog := b.GetCatalog(ctx)
-		return catalog.Keys()
+		return pool.Models(ctx).Keys()
 	}
 
-	// Subscription account loop: refreshes identity metadata from /user/status
-	// and authoritative allowance totals from OpenAPI /api/v2/quota/usage out
-	// of band. The admin panel's 15-second poll remains memory-only.
+	// Subscription account loop: for every account in the pool it bootstraps or
+	// renews the session, warms the model catalog, and refreshes the identity
+	// metadata from /user/status plus the authoritative allowance from OpenAPI
+	// /api/v2/quota/usage — all out of band. The admin panel's 15-second poll
+	// remains memory-only.
 	//
 	// The loop has its own stop/done pair so shutdown can join it before the
 	// final stats flush: its last SetAccount/SetBillingCycle would otherwise
 	// land after that flush and be lost on exit.
 	accountStop := make(chan struct{})
 	accountDone := make(chan struct{})
-	applyAccount := func(ctx context.Context) {
-		// Capture the PAT this refresh belongs to: if it changes while the
-		// fetch is in flight, the snapshot must be dropped rather than written
-		// after the PAT-change hook cleared the previous account.
-		pat := provider.store.GetPAT()
-		b := provider.currentBridge()
-		if b == nil {
-			return // no PAT configured yet
-		}
-		st := b.EnsureAccountStatus(ctx)
-		if st == nil {
-			return // upstream unreachable: keep the last known state
-		}
-		account := &stats.Account{
-			Plan:                 st.Plan,
-			Tag:                  st.UserTag,
-			OrgName:              st.OrgName,
-			IsQuotaExceeded:      st.IsQuotaExceeded,
-			TotalUsagePercentage: st.TotalUsagePercentage,
-		}
-		if st.UserQuota != nil {
-			account.UserQuota = &stats.Quota{
-				Total: st.UserQuota.Total, Used: st.UserQuota.Used,
-				Remaining: st.UserQuota.Remaining, Percentage: st.UserQuota.Percentage,
-				Unit: st.UserQuota.Unit, DetailURL: st.UserQuota.DetailURL,
-			}
-		}
-		if st.AddOnQuota != nil {
-			account.AddOnQuota = &stats.Quota{
-				Total: st.AddOnQuota.Total, Used: st.AddOnQuota.Used,
-				Remaining: st.AddOnQuota.Remaining, Percentage: st.AddOnQuota.Percentage,
-				Unit: st.AddOnQuota.Unit, DetailURL: st.AddOnQuota.DetailURL,
-			}
-		}
-		if st.OrgResourcePackage != nil {
-			account.OrgResourcePackage = &stats.OrgResourcePackage{
-				Used: st.OrgResourcePackage.Used, Cap: st.OrgResourcePackage.Cap,
-				Remaining: st.OrgResourcePackage.Remaining, Percentage: st.OrgResourcePackage.Percentage,
-				Available: st.OrgResourcePackage.Available, Unit: st.OrgResourcePackage.Unit,
-			}
-		}
-		// The write section runs under patWriteMu and re-checks the PAT inside it:
-		// the PAT-change hook clears the recorder under the same lock, so a
-		// snapshot fetched for the previous PAT can no longer land after that
-		// clear. The fetch above stays outside the lock (it can take 30s).
-		applyAccountWrite(rec, provider, pat, st.NextResetAtMs, account)
-	}
 	go func() {
 		defer close(accountDone)
 		// Fetch once immediately so the panel is populated from the start
-		// rather than after the first tick.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		applyAccount(ctx)
+		// rather than after the first tick, and so a freshly added token does
+		// not make the client pay for a cold session on its first request.
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		refreshAccounts(ctx, pool, st, rec)
 		cancel()
 
 		ticker := time.NewTicker(accountRefreshCadence)
@@ -343,8 +393,8 @@ func main() {
 		for {
 			select {
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				applyAccount(ctx)
+				ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				refreshAccounts(ctx, pool, st, rec)
 				cancel()
 			case <-accountStop:
 				return
@@ -353,7 +403,7 @@ func main() {
 	}()
 
 	// Initialize admin
-	adminInst := admin.New(st, modelFetcher, rec, logRec)
+	adminInst := admin.New(st, modelFetcher, rec, logRec, pool)
 
 	// WebUI: pre-render all pages at startup (multi-page Alpine.js frontend,
 	// no build step, no external dependencies).
@@ -362,10 +412,11 @@ func main() {
 		log.Fatalf("[web] failed to init: %v", err)
 	}
 
+	resolver := resolveAccess(st, pool)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(provider.resolveBridge, rec, logRec))
-	mux.HandleFunc("/v1/models", bridge.MakeModelsHandler(provider.resolveBridge))
-	mux.HandleFunc("/health", healthHandler(st))
+	mux.HandleFunc("/v1/chat/completions", bridge.MakeChatHandler(resolver, rec, logRec))
+	mux.HandleFunc("/v1/models", bridge.MakeModelsHandler(resolver))
+	mux.HandleFunc("/health", healthHandler(pool))
 
 	// Root redirect to admin UI
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

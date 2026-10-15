@@ -328,6 +328,24 @@ func (e *UnsupportedModelError) Error() string {
 	return "Unsupported model '" + e.Model + "'. Supported: " + e.Supported
 }
 
+// CapabilityError is returned when the model itself resolves but this account's
+// catalog cannot serve the requested capability (images, for now). It is a
+// property of the account's plan, not of the client's request: another account
+// in the pool may serve the same request, so callers classify it as a routing
+// miss rather than a client error.
+type CapabilityError struct {
+	Model     string
+	Supported string
+}
+
+func (e *CapabilityError) Error() string {
+	supported := e.Supported
+	if supported == "" {
+		supported = "(none)"
+	}
+	return "Image input is not supported by model '" + e.Model + "'. Use one of: " + supported + "."
+}
+
 // nameForKey reverse-looks-up the display_name for a given qoder key,
 // falling back to a cost-aware default when the key is absent.
 func nameForKey(modelMap map[string]string, key string) string {

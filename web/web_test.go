@@ -517,8 +517,9 @@ func TestEmbedShape(t *testing.T) {
 }
 
 // TestMovedModelsAndTier 面板结构调整的回归：模型列表迁入统计页（点击复制语义不变），账号
-// 等级徽标移到令牌页，令牌页提供跳转 Qoder 集成页的创建令牌链接。断言基于页面源文件——
-// 每份文档都内嵌全部 view，对渲染产物断言「不存在」定位不到具体页面。
+// 等级徽标改为令牌页账号池的逐行徽标（数据来自 /admin/api/tokens），令牌页提供跳转 Qoder
+// 集成页的创建令牌链接。断言基于页面源文件——每份文档都内嵌全部 view，对渲染产物断言
+// 「不存在」定位不到具体页面。
 func TestMovedModelsAndTier(t *testing.T) {
 	read := func(fsys fs.FS, name string) string {
 		t.Helper()
@@ -554,22 +555,29 @@ func TestMovedModelsAndTier(t *testing.T) {
 	}
 
 	token := read(pageFS, "pages/token.html")
-	if !strings.Contains(token, `x-text="accountTag"`) {
-		t.Error("令牌页缺少账号等级徽标")
-	}
-	if !strings.Contains(token, `href="https://qoder.cn/account/integrations"`) {
-		t.Error("令牌页缺少跳转 Qoder 集成页创建令牌的链接")
+	// 账号池化后等级徽标是每行一个（来自 /admin/api/tokens 的逐账号快照），不再是全局单个
+	for _, want := range []string{
+		`x-for="t in tokens"`,
+		`x-text="t.tag"`,
+		`x-model.number="t.weight"`, // 权重就地编辑
+		`href="https://qoder.cn/account/integrations"`,
+	} {
+		if !strings.Contains(token, want) {
+			t.Errorf("令牌页缺少账号池元素 %s", want)
+		}
 	}
 
-	// 令牌页要渲染等级徽标，其 load() 必须拉取 stats 快照（徽标数据源）
 	tokenJS := read(assetFS, "assets/pages/token.js")
-	if !strings.Contains(tokenJS, "this.loadStats()") {
-		t.Error("令牌页 load() 必须加载 stats 快照（等级徽标的数据源）")
+	if !strings.Contains(tokenJS, "/admin/api/tokens") {
+		t.Error("令牌页 load() 必须加载账号池快照（等级徽标与额度的数据源）")
 	}
 	// 模型列表迁入统计页后，其加载动作随之迁到 stats 页面层
 	statsJS := read(assetFS, "assets/pages/stats.js")
 	if !strings.Contains(statsJS, "this.loadModels()") {
 		t.Error("统计页 load() 必须加载模型列表（模型页已移除）")
+	}
+	if strings.Contains(statsJS, "get accountTag()") {
+		t.Error("单账号时代的统计页等级 getter 已无用，应删除")
 	}
 }
 
